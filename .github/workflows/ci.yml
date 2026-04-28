@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  backend:
+    name: Backend Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+  docker:
+    name: Docker Images
+    runs-on: ubuntu-latest
+    needs: [frontend, backend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t devops-benchmark-backend:ci ./backend
+
+      - name: Build frontend image
+        run: docker build -t devops-benchmark-frontend:ci ./frontend
+
+      - name: Build benchmark target image
+        run: docker build -t devops-benchmark-target:ci ./benchmark-target
+
+  benchmark:
+    name: Real Benchmark Smoke Test
+    runs-on: ubuntu-latest
+    needs: [docker]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start services
+        run: docker compose up -d --build postgres backend benchmark-target
+
+      - name: Wait for backend
+        run: |
+          for i in {1..30}; do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' devops-benchmark-backend)" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs backend
+          exit 1
+
+      - name: Wait for benchmark target
+        run: |
+          for i in {1..30}; do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' devops-benchmark-target)" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs benchmark-target
+          exit 1
+
+      - name: Trigger real benchmark
+        run: |
+          curl -sS -X POST http://localhost:3000/benchmark-runs \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "environmentType": "docker",
+              "benchmarkMode": "real",
+              "targetUrl": "http://benchmark-target:4000/health",
+              "vus": 1,
+              "durationSeconds": 2,
+              "dockerImage": "nginx:alpine",
+              "scalingContainers": 1
+            }' | tee benchmark-result.json
+
+      - name: Validate benchmark result
+        run: |
+          node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync('benchmark-result.json','utf8')); if (r.status !== 'completed') { console.error(r); process.exit(1); }"
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-result
+          path: benchmark-result.json
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v

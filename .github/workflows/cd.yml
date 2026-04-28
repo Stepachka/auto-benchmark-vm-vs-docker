@@ -1,0 +1,122 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy To Server
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ vars.SERVER_IP }}
+          username: root
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: 22
+          script: |
+            set -eu
+
+            APP_DIR="${{ vars.DEPLOY_PATH || '/opt/devops-benchmark-platform' }}"
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+            DEPLOY_BRANCH="main"
+            DOMAIN="${{ vars.SERVER_DOMAIN || 'auto-benchmark-vm-vs-docker.stepan-talabaev.ru' }}"
+            LETSENCRYPT_EMAIL="${{ vars.LETSENCRYPT_EMAIL || '' }}"
+            NGINX_SITE_NAME="auto-benchmark-vm-vs-docker"
+            NGINX_CONFIG_PATH="/etc/nginx/sites-available/$NGINX_SITE_NAME"
+
+            mkdir -p "$APP_DIR"
+
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone --branch "$DEPLOY_BRANCH" --depth 1 "$REPO_URL" "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+            git remote set-url origin "$REPO_URL"
+            git fetch --depth 1 origin "$DEPLOY_BRANCH"
+            git checkout "$DEPLOY_BRANCH"
+            git reset --hard "origin/$DEPLOY_BRANCH"
+
+            if [ -z "$LETSENCRYPT_EMAIL" ]; then
+              echo "GitHub variable LETSENCRYPT_EMAIL is required for certbot."
+              exit 1
+            fi
+
+            printf 'HOST_BIND_IP=127.0.0.1\nVITE_API_BASE_URL=/api\n' > .env.deploy
+
+            docker compose --env-file .env.deploy up -d --build --remove-orphans
+
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y nginx certbot curl
+            mkdir -p /var/www/certbot
+
+            sed "s/__SERVER_DOMAIN__/$DOMAIN/g" infra/nginx/site-http.conf.template > "$NGINX_CONFIG_PATH"
+            ln -sfn "$NGINX_CONFIG_PATH" "/etc/nginx/sites-enabled/$NGINX_SITE_NAME"
+            rm -f /etc/nginx/sites-enabled/default
+            nginx -t
+            systemctl enable --now nginx
+            systemctl reload nginx
+
+            if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+              certbot certonly \
+                --webroot \
+                --webroot-path /var/www/certbot \
+                --domain "$DOMAIN" \
+                --email "$LETSENCRYPT_EMAIL" \
+                --agree-tos \
+                --non-interactive \
+                --keep-until-expiring
+            fi
+
+            sed "s/__SERVER_DOMAIN__/$DOMAIN/g" infra/nginx/site-https.conf.template > "$NGINX_CONFIG_PATH"
+            nginx -t
+            systemctl reload nginx
+            systemctl enable --now certbot.timer || true
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:3000/health >/dev/null; then
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                docker compose logs backend
+                exit 1
+              fi
+              sleep 2
+            done
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:5173 >/dev/null; then
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                docker compose logs frontend
+                exit 1
+              fi
+              sleep 2
+            done
+
+            curl -fsS --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" >/dev/null
+            curl -fsS --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" >/dev/null
+
+            docker compose ps
