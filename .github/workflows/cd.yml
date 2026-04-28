@@ -30,7 +30,7 @@ jobs:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ vars.SERVER_IP }}
+          host: ${{ secrets.SERVER_IP }}
           username: root
           password: ${{ secrets.SERVER_PASSWORD }}
           port: 22
@@ -41,7 +41,7 @@ jobs:
             REPO_URL="https://github.com/${{ github.repository }}.git"
             DEPLOY_BRANCH="main"
             DOMAIN="${{ vars.SERVER_DOMAIN || 'auto-benchmark-vm-vs-docker.stepan-talabaev.ru' }}"
-            LETSENCRYPT_EMAIL="${{ vars.LETSENCRYPT_EMAIL || '' }}"
+            LETSENCRYPT_EMAIL="${{ vars.LETSENCRYPT_EMAIL || 'stepan.talabaev@mail.ru' }}"
             NGINX_SITE_NAME="auto-benchmark-vm-vs-docker"
             NGINX_CONFIG_PATH="/etc/nginx/sites-available/$NGINX_SITE_NAME"
 
@@ -56,11 +56,6 @@ jobs:
             git fetch --depth 1 origin "$DEPLOY_BRANCH"
             git checkout "$DEPLOY_BRANCH"
             git reset --hard "origin/$DEPLOY_BRANCH"
-
-            if [ -z "$LETSENCRYPT_EMAIL" ]; then
-              echo "GitHub variable LETSENCRYPT_EMAIL is required for certbot."
-              exit 1
-            fi
 
             printf 'HOST_BIND_IP=127.0.0.1\nVITE_API_BASE_URL=/api\n' > .env.deploy
 
